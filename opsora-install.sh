@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# OPSORA - single-file native installer for Ubuntu Server 24.04 LTS
+# OPSORA - single-file native installer for Ubuntu Server 24.04 LTS   (v2.1)
 #
 # Native only: apt, vendor apt repos, signed .deb, official binaries, venv/pipx,
 # systemd, Nginx. This script never installs Docker, Podman, containerd,
@@ -15,11 +15,13 @@
 #   sudo bash opsora-install.sh --list          list steps
 #   sudo bash opsora-install.sh --help
 #
-# First run writes /opt/opsora/config/install.env (mode 600). Any variable in
-# that file can be pre-seeded from the environment on the first run, e.g.:
-#   sudo OPENOBSERVE_DOMAIN=observe.example.com LETSENCRYPT_EMAIL=me@example.com \
-#        bash opsora-install.sh
-# Later runs read the file; edit it and re-run. Re-running is safe.
+# Settings live in /opt/opsora/config/install.env (mode 600, written on first run).
+# Any setting can also be given on the command line; it is saved to that file:
+#   sudo LAN_ACCESS=true bash opsora-install.sh          web UIs on the LAN IP (lab)
+#   sudo OPENOBSERVE_DOMAIN=observe.mydomain.tld LETSENCRYPT_EMAIL=me@mydomain.tld \
+#        bash opsora-install.sh                           HTTPS with a real hostname
+# With neither, UIs listen on 127.0.0.1 only. Re-running is safe.
+# After install:  sudo opsora-health-check    sudo opsora-credentials
 #
 # The script never runs DROP DATABASE, DROP TABLE, terraform destroy, or rm -rf
 # on data directories.
@@ -137,6 +139,15 @@ write_file() {
   fi
   chmod "$mode" "$path"; chown "$owner" "$path"
 }
+# OpenObserve 1.x rejects root passwords without lower+upper+digit+special character.
+# A password that lacks a special character can never have been accepted, so upgrading it is safe.
+o2_password() {
+  local f=$SECRETS_DIR/openobserve_root p
+  install -d -m 0700 "$SECRETS_DIR"
+  if [[ ! -s $f ]]; then ( umask 077; echo "$(gen_secret 24)aA1!" >"$f" )
+  else p=$(cat "$f"); if [[ $p != *[!A-Za-z0-9]* ]]; then ( umask 077; echo "${p}aA1!" >"$f" ); fi; fi
+  chmod 600 "$f"; cat "$f"
+}
 gen_secret() { openssl rand -base64 96 | tr -dc 'A-Za-z0-9' | cut -c1-"${1:-32}"; }
 # secret NAME [LEN] -> prints secret, creating it once
 secret() {
@@ -157,9 +168,13 @@ ensure_user() { # NAME HOME [EXTRA_GROUPS]
   [[ -n $groups ]] && usermod -aG "$groups" "$name"
   return 0
 }
-apt_install() { apt-get install -y --no-install-recommends "$@"; }
+# Wait up to 15 minutes for the apt/dpkg lock (unattended-upgrades often holds it on a fresh VM)
+apt_get() { apt-get -o DPkg::Lock::Timeout=900 "$@"; }
+apt_install() { apt_get install -y --no-install-recommends "$@"; }
+# install a local .deb through apt so it honours the same lock timeout
+deb_install() { apt_get install -y --allow-downgrades --allow-change-held-packages "$1"; }
 APT_UPDATED=0
-apt_update() { apt-get update -q || warn "apt-get update reported errors (continuing with existing package lists)"; APT_UPDATED=1; }
+apt_update() { apt_get update -q || warn "apt-get update reported errors (continuing with existing package lists)"; APT_UPDATED=1; }
 apt_update_once() { (( APT_UPDATED )) || apt_update; }
 
 fetch() { # URL DEST
@@ -234,6 +249,14 @@ RESTRICT_UI_TO_TRUSTED="${RESTRICT_UI_TO_TRUSTED:-false}"   # true = web UIs onl
 OTLP_BIND="${OTLP_BIND:-127.0.0.1}"               # set to a private IP to receive OTLP from TRUSTED_NETWORKS
 CONFIGURE_UFW="${CONFIGURE_UFW:-true}"
 
+# --- LAN access without a domain ---------------------------------------------
+# true = publish the web UIs on this server's LAN address over plain HTTP on their
+# default ports (5080, 3001, 3000, 5050, 9090, 9093), firewalled to LAN_NETWORK.
+# Lab/LAN use only. LAN_IP / LAN_NETWORK are auto-detected when left empty.
+LAN_ACCESS="${LAN_ACCESS:-false}"
+LAN_IP="${LAN_IP:-}"
+LAN_NETWORK="${LAN_NETWORK:-}"
+
 # --- SSH hardening (both off by default so nobody gets locked out) -----------
 SSH_DISABLE_PASSWORD_LOGIN="${SSH_DISABLE_PASSWORD_LOGIN:-false}"
 SSH_DISABLE_ROOT_LOGIN="${SSH_DISABLE_ROOT_LOGIN:-false}"
@@ -274,16 +297,65 @@ EOF
   sed 's/=".*@.*"/=""/' "$CONF_FILE" >"$OPSORA_HOME/config/install.env.example"; chmod 644 "$OPSORA_HOME/config/install.env.example"
   log "wrote $CONF_FILE"
 }
+CONFIG_VARS=(OPSORA_ADMIN_EMAIL LETSENCRYPT_EMAIL OPENOBSERVE_DOMAIN PROMETHEUS_DOMAIN ALERTMANAGER_DOMAIN KEEP_DOMAIN
+  PGADMIN_DOMAIN SEMAPHORE_DOMAIN TRUSTED_NETWORKS RESTRICT_UI_TO_TRUSTED OTLP_BIND CONFIGURE_UFW LAN_ACCESS LAN_IP LAN_NETWORK
+  SSH_DISABLE_PASSWORD_LOGIN SSH_DISABLE_ROOT_LOGIN AI_PROVIDER AI_MODEL KUBECONFIG_PATH ENABLE_KEEP ENABLE_OPENRCA
+  OPENRCA_INSTALL_DEPS ENABLE_REDIS_INSIGHT OPENOBSERVE_RETENTION_DAYS PROMETHEUS_RETENTION BACKUP_RETENTION_DAYS
+  ALERT_WEBHOOK_URL OPENOBSERVE_URL OPENOBSERVE_SHA256)
+# set_config VAR VALUE : persist one setting in install.env
+set_config() {
+  local v=$1 val=$2 tmp; tmp=$(mktemp)
+  awk -v v="$v" -v val="$val" 'BEGIN{d=0} $0 ~ "^"v"=" {print v"=\""val"\""; d=1; next} {print} END{if(!d) print v"=\""val"\""}' "$CONF_FILE" >"$tmp"
+  cat "$tmp" >"$CONF_FILE"; rm -f "$tmp"; chmod 600 "$CONF_FILE"
+}
 load_config() {
+  # values given on the command line / environment win over the file and are saved to it
+  local v d; declare -A from_env=()
+  for v in "${CONFIG_VARS[@]}"; do if [[ -n ${!v+x} ]]; then from_env[$v]=${!v}; fi; done
   [[ -f $CONF_FILE ]] || write_default_config
   # shellcheck disable=SC1090
   source "$CONF_FILE"
+  for v in "${!from_env[@]}"; do
+    if [[ ${!v-} != "${from_env[$v]}" ]] || ! grep -q "^$v=" "$CONF_FILE"; then
+      printf -v "$v" '%s' "${from_env[$v]}"; set_config "$v" "${from_env[$v]}"; log "config: $v set from environment"
+    fi
+  done
+  # settings added in later versions of this script
+  : "${LAN_ACCESS:=false}" "${LAN_IP:=}" "${LAN_NETWORK:=}"
+  # documentation placeholders are not real hostnames
+  for v in OPENOBSERVE_DOMAIN PROMETHEUS_DOMAIN ALERTMANAGER_DOMAIN KEEP_DOMAIN PGADMIN_DOMAIN SEMAPHORE_DOMAIN LETSENCRYPT_EMAIL; do
+    d=${!v-}
+    if [[ $d =~ (^|[.@])example\.(com|org|net)$ ]]; then
+      warn "$v=\"$d\" is a documentation placeholder, not a real name: ignored and cleared in $CONF_FILE"
+      printf -v "$v" '%s' ""; set_config "$v" ""
+    fi
+  done
+  if is_true "$LAN_ACCESS"; then
+    [[ -n $LAN_IP ]] || LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+    [[ -n $LAN_NETWORK || -z $LAN_IP ]] || LAN_NETWORK=$(ip -4 route show scope link 2>/dev/null | awk -v ip="$LAN_IP" '$0 ~ "src "ip"( |$)" {print $1; exit}')
+    [[ -n $LAN_IP && -n $LAN_NETWORK ]] || die "LAN_ACCESS=true but LAN_IP/LAN_NETWORK could not be detected; set them in $CONF_FILE"
+  fi
   : "${OPENOBSERVE_URL:=}"
   [[ -n $OPENOBSERVE_URL ]] || OPENOBSERVE_URL="https://downloads.openobserve.ai/releases/openobserve/v${OPENOBSERVE_VERSION}/openobserve-v${OPENOBSERVE_VERSION}-linux-${ARCH}.tar.gz"
+  # Ubuntu 24.04 socket-activates ssh: /run/sshd only exists once ssh.service has run, and sshd -t/-T need it
+  if have sshd; then install -d -m 0755 /run/sshd; fi
   SSH_PORT=$( { sshd -T 2>/dev/null || true; } | awk '$1=="port"{print $2; exit}'); SSH_PORT=${SSH_PORT:-22}
   # only emit IPv6 listeners when the kernel has IPv6 enabled
   L6_80=""; L6_80D=""; L6_443=""
   if [[ -f /proc/net/if_inet6 ]]; then L6_80="listen [::]:80;"; L6_80D="listen [::]:80 default_server;"; L6_443="listen [::]:443 ssl http2;"; fi
+}
+# ui_url DOMAIN PORT -> the address a browser should use for that UI
+ui_url() {
+  if [[ -n $1 ]]; then echo "https://$1"
+  elif is_true "$LAN_ACCESS"; then echo "http://$LAN_IP:$2"
+  else echo "http://127.0.0.1:$2"; fi
+}
+ensure_htpasswd() {
+  local want; want=$(secret nginx_basic_auth 24)
+  if [[ ! -f /etc/nginx/opsora.htpasswd ]]; then
+    printf 'admin:%s\n' "$(openssl passwd -apr1 "$want")" >/etc/nginx/opsora.htpasswd
+  fi
+  chown root:www-data /etc/nginx/opsora.htpasswd; chmod 640 /etc/nginx/opsora.htpasswd
 }
 all_domains() {
   local d
@@ -311,7 +383,7 @@ step_preflight() {
   echo; echo "IP addresses:";  ip -br addr 2>/dev/null | awk '{print "  " $0}'
   echo; echo "Filesystems:";   df -hT -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk '{print "  " $0}'
   echo
-  [[ ${VERSION_ID:-} == "24.04" ]] || { warn "Ubuntu 24.04 required, found ${PRETTY_NAME}"; is_true "${ALLOW_UNSUPPORTED_OS:-false}" || fail=1; }
+  [[ ${VERSION_ID:-} == "24.04" ]] || { warn "Ubuntu 24.04 required, found ${PRETTY_NAME}. This installer uses apt/dpkg/ufw and cannot run on other distributions."; is_true "${ALLOW_UNSUPPORTED_OS:-false}" || fail=1; }
   [[ $ARCH == amd64 || $ARCH == arm64 ]] || { warn "unsupported architecture $ARCH"; fail=1; }
   [[ $(ps -p 1 -o comm= 2>/dev/null) == systemd ]] || { warn "PID 1 is not systemd"; fail=1; }
   ram=$(ram_mb); (( ram >= 15000 )) || warn "RAM ${ram} MB is below the 16 GB practical minimum (64 GB recommended)"
@@ -457,6 +529,7 @@ step_security() {
     echo "LoginGraceTime 30"
     echo "X11Forwarding no"
   } | write_file /etc/ssh/sshd_config.d/90-opsora.conf 0644
+  install -d -m 0755 /run/sshd
   if sshd -t; then
     (( WF_CHANGED )) && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true; }
   else
@@ -843,7 +916,7 @@ step_openobserve() {
   local cache_mb; cache_mb=$(clamp $(( $(ram_mb) / 8 )) 512 16384)
   write_file "$SECRETS_DIR/openobserve.env" 0600 <<EOF
 ZO_ROOT_USER_EMAIL=$OPSORA_ADMIN_EMAIL
-ZO_ROOT_USER_PASSWORD=$(secret openobserve_root 28)
+ZO_ROOT_USER_PASSWORD=$(o2_password)
 ZO_DATA_DIR=/var/lib/openobserve/
 ZO_LOCAL_MODE=true
 ZO_HTTP_ADDR=127.0.0.1
@@ -864,7 +937,7 @@ LimitNOFILE=262144"
   svc_enable_restart openobserve "$changed"
   wait_http http://127.0.0.1:5080/healthz 45 || die "OpenObserve /healthz not answering"
   # ingestion + search round trip
-  local auth="$OPSORA_ADMIN_EMAIL:$(secret openobserve_root 28)" marker="opsora-install-$RUN_TS" now start hits=0 i
+  local auth="$OPSORA_ADMIN_EMAIL:$(o2_password)" marker="opsora-install-$RUN_TS" now start hits=0 i
   curl -fsS -u "$auth" -H 'Content-Type: application/json' \
     -d "[{\"level\":\"info\",\"source\":\"opsora-installer\",\"message\":\"$marker\"}]" \
     http://127.0.0.1:5080/api/default/opsora_selftest/_json >/dev/null || die "OpenObserve test ingestion failed (login or ingest)"
@@ -892,7 +965,7 @@ step_alloy() {
     apt_update
   fi
   if ! dpkg-query -W -f='${Version}' alloy 2>/dev/null | grep -q "^$ALLOY_VERSION"; then
-    apt-get install -y --allow-downgrades --allow-change-held-packages "alloy=${ALLOY_VERSION}*"
+    apt_get install -y --allow-downgrades --allow-change-held-packages "alloy=${ALLOY_VERSION}*"
   fi
   apt-mark hold alloy >/dev/null
   usermod -aG adm,systemd-journal alloy
@@ -900,7 +973,7 @@ step_alloy() {
   local changed=0
   write_file "$SECRETS_DIR/alloy.env" 0600 <<EOF
 O2_USER=$OPSORA_ADMIN_EMAIL
-O2_PASSWORD=$(secret openobserve_root 28)
+O2_PASSWORD=$(o2_password)
 EOF
   (( changed |= WF_CHANGED )) || true
   write_file /etc/alloy/config.alloy 0644 <<EOF
@@ -1205,12 +1278,12 @@ step_prometheus() {
     /etc/prometheus/file_sd/{node,postgres,mysql,snmp,blackbox-http,blackbox-tcp,blackbox-icmp,blackbox-dns,kube-state-metrics}
   install -d -m 0750 -o root -g prometheus /etc/prometheus/secrets
   local changed=0
-  secret openobserve_root 28 | tr -d '\n' | write_file /etc/prometheus/secrets/openobserve_password 0640 root:prometheus
+  o2_password | tr -d '\n' | write_file /etc/prometheus/secrets/openobserve_password 0640 root:prometheus
   (( changed |= WF_CHANGED )) || true
   write_prometheus_rules;  (( changed |= WF_CHANGED )) || true
   write_prometheus_config; (( changed |= WF_CHANGED )) || true
   promtool check config /etc/prometheus/prometheus.yml
-  local ext=""; [[ -n $PROMETHEUS_DOMAIN ]] && ext=" --web.external-url=https://$PROMETHEUS_DOMAIN"
+  local ext=""; if [[ -n $PROMETHEUS_DOMAIN ]] || is_true "$LAN_ACCESS"; then ext=" --web.external-url=$(ui_url "$PROMETHEUS_DOMAIN" 9090)"; fi
   go_unit prometheus prometheus "Prometheus" \
 "/usr/local/bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus --storage.tsdb.retention.time=$PROMETHEUS_RETENTION --web.listen-address=127.0.0.1:9090 --web.enable-lifecycle$ext" \
 "ExecReload=/bin/kill -HUP \$MAINPID
@@ -1281,7 +1354,7 @@ receivers:
 EOF
   (( changed |= WF_CHANGED )) || true
   amtool check-config /etc/alertmanager/alertmanager.yml
-  local ext=""; [[ -n $ALERTMANAGER_DOMAIN ]] && ext=" --web.external-url=https://$ALERTMANAGER_DOMAIN"
+  local ext=""; if [[ -n $ALERTMANAGER_DOMAIN ]] || is_true "$LAN_ACCESS"; then ext=" --web.external-url=$(ui_url "$ALERTMANAGER_DOMAIN" 9093)"; fi
   go_unit alertmanager alertmanager "Alertmanager" \
 "/usr/local/bin/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/var/lib/alertmanager --web.listen-address=127.0.0.1:9093 --cluster.listen-address=$ext" \
 "ExecReload=/bin/kill -HUP \$MAINPID"
@@ -1472,7 +1545,7 @@ step_keep() {
     touch "$marker"; changed=1
   fi
   site=$("$venv/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
-  local base_url="http://127.0.0.1:3001"; [[ -n $KEEP_DOMAIN ]] && base_url="https://$KEEP_DOMAIN"
+  local base_url; base_url=$(ui_url "$KEEP_DOMAIN" 3001)
   write_file "$SECRETS_DIR/keep-api.env" 0600 <<EOF
 PORT=8080
 AUTH_TYPE=DB
@@ -1667,7 +1740,7 @@ step_k8sgpt() {
     sums_name="k8sgpt_${ARCH}.deb"; file=$CACHE_DIR/k8sgpt_${K8SGPT_VERSION}_${ARCH}.deb
     fetch "$base/$sums_name" "$file"
     verify_from_sums "$file" "$base/checksums.txt" "$sums_name" "$sums_name@$K8SGPT_VERSION"
-    dpkg -i "$file"
+    deb_install "$file"
   fi
   ensure_user k8sgpt "$STATE_DIR/k8sgpt"
   ai_env_file
@@ -1871,7 +1944,7 @@ step_terraform() {
     apt_update
   fi
   if [[ $(terraform version -json 2>/dev/null | jq -r .terraform_version) != "$TERRAFORM_VERSION" ]]; then
-    apt-get install -y --allow-downgrades --allow-change-held-packages "terraform=${TERRAFORM_VERSION}*"
+    apt_get install -y --allow-downgrades --allow-change-held-packages "terraform=${TERRAFORM_VERSION}*"
   fi
   apt-mark hold terraform >/dev/null
   local t=$OPSORA_HOME/terraform
@@ -1912,7 +1985,7 @@ step_semaphore() {
     file=$CACHE_DIR/semaphore_${SEMAPHORE_VERSION}_linux_${ARCH}.deb
     fetch "$base/$(basename "$file")" "$file"
     verify_from_sums "$file" "$base/semaphore_${SEMAPHORE_VERSION}_checksums.txt"
-    dpkg -i "$file"; changed=1
+    deb_install "$file"; changed=1
   fi
   ensure_user semaphore /var/lib/semaphore
   install -d -m 0750 -o semaphore -g semaphore /var/lib/semaphore/tmp
@@ -1920,7 +1993,7 @@ step_semaphore() {
   port=$(pg_port); port=${port:-5432}
   pg_role semaphore "$(secret pg_semaphore)" 30
   pg_db semaphore semaphore
-  local web="http://127.0.0.1:3000"; [[ -n $SEMAPHORE_DOMAIN ]] && web="https://$SEMAPHORE_DOMAIN"
+  local web; web=$(ui_url "$SEMAPHORE_DOMAIN" 3000)
   # the three keys must be base64 of 32 random bytes and must never change once data exists
   local k
   for k in semaphore_cookie_hash semaphore_cookie_encryption semaphore_access_key_encryption; do
@@ -2066,10 +2139,7 @@ step_vhosts() {
   if [[ -z $(all_domains) ]]; then
     status vhosts SKIPPED "no domains configured: UIs on 127.0.0.1 only"; status tls SKIPPED "no domains configured"; return 0
   fi
-  if [[ ! -f /etc/nginx/opsora.htpasswd ]]; then
-    printf 'admin:%s\n' "$(openssl passwd -apr1 "$(secret nginx_basic_auth 24)")" >/etc/nginx/opsora.htpasswd
-  fi
-  chown root:www-data /etc/nginx/opsora.htpasswd; chmod 640 /etc/nginx/opsora.htpasswd
+  ensure_htpasswd
   local failed=""
   vhost openobserve  "$OPENOBSERVE_DOMAIN"  127.0.0.1:5080 app   || failed+=" $OPENOBSERVE_DOMAIN"
   vhost prometheus   "$PROMETHEUS_DOMAIN"   127.0.0.1:9090 basic || failed+=" $PROMETHEUS_DOMAIN"
@@ -2092,6 +2162,82 @@ EOF
     status vhosts WARNING "no certificate, backend NOT exposed, for:$failed"
     status tls WARNING "certificate missing for:$failed"
   fi
+}
+
+# =============================================================================
+# STEP: lan  (optional: web UIs on the LAN address, default ports, plain HTTP)
+# Nginx binds LAN_IP:<port> while each service keeps 127.0.0.1:<port>.
+# =============================================================================
+LAN_UIS=(openobserve:5080:app keep:3001:app semaphore:3000:app pgadmin:5050:app prometheus:9090:basic alertmanager:9093:basic)
+step_lan() {
+  local f=/etc/nginx/conf.d/20-opsora-lan.conf e name port auth
+  if ! is_true "$LAN_ACCESS"; then
+    if [[ -f $f ]] && grep -q 'Managed by OPSORA installer' "$f"; then
+      backup_path "$f"; rm -f "$f" /etc/opsora/lan.env; nginx -t && systemctl reload nginx
+      warn "LAN access switched off: Nginx LAN listeners removed. Remove the 'OPSORA LAN UI' firewall rules with: ufw status numbered; ufw delete <n>"
+    elif [[ -f $f ]]; then
+      warn "$f exists but was not written by this installer: left untouched. Set LAN_ACCESS=true in $CONF_FILE to manage it here."
+    fi
+    status lan SKIPPED "LAN_ACCESS=false: UIs on 127.0.0.1 (SSH tunnel) or via configured domains"; return 0
+  fi
+  ensure_htpasswd
+  write_file /etc/sysctl.d/91-opsora-lan.conf <<'EOF'
+# OPSORA: let Nginx bind the LAN address at boot before the interface is up
+net.ipv4.ip_nonlocal_bind = 1
+EOF
+  sysctl -q -p /etc/sysctl.d/91-opsora-lan.conf || warn "could not apply net.ipv4.ip_nonlocal_bind"
+  {
+    echo "# Managed by OPSORA installer (lan step). Plain HTTP for LAN use: $LAN_NETWORK only (enforced by UFW)."
+    for e in "${LAN_UIS[@]}"; do
+      IFS=: read -r name port auth <<<"$e"
+      if [[ $name == keep ]] && ! is_true "$ENABLE_KEEP"; then continue; fi
+      echo "server {"
+      echo "    listen $LAN_IP:$port;"
+      echo "    server_name _;"
+      echo "    client_max_body_size 64m;"
+      echo "    access_log /var/log/nginx/opsora-lan-$name.access.log;"
+      echo "    error_log  /var/log/nginx/opsora-lan-$name.error.log;"
+      echo "    location / {"
+      if [[ $auth == basic ]]; then
+        echo "        auth_basic \"OPSORA $name\";"
+        echo "        auth_basic_user_file /etc/nginx/opsora.htpasswd;"
+      fi
+      echo "        proxy_pass http://127.0.0.1:$port;"
+      echo "        proxy_http_version 1.1;"
+      echo "        proxy_set_header Host \$http_host;"
+      echo "        proxy_set_header X-Real-IP \$remote_addr;"
+      echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+      echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+      echo "        proxy_set_header Upgrade \$http_upgrade;"
+      echo "        proxy_set_header Connection \$opsora_connection_upgrade;"
+      echo "        proxy_connect_timeout 15s;"
+      echo "        proxy_read_timeout 300s;"
+      echo "        proxy_buffering off;"
+      echo "    }"
+      echo "}"
+    done
+  } | write_file "$f" 0644
+  nginx -t; systemctl reload nginx
+  local ports=""
+  for e in "${LAN_UIS[@]}"; do
+    IFS=: read -r name port auth <<<"$e"
+    if [[ $name == keep ]] && ! is_true "$ENABLE_KEEP"; then continue; fi
+    ports+=" $port"
+    if is_true "$CONFIGURE_UFW"; then ufw allow from "$LAN_NETWORK" to any port "$port" proto tcp comment 'OPSORA LAN UI' >/dev/null; fi
+  done
+  ports=${ports# }
+  write_file /etc/opsora/lan.env 0644 <<EOF
+LAN_IP=$LAN_IP
+LAN_NETWORK=$LAN_NETWORK
+LAN_PORTS="$ports"
+EOF
+  local bad="" code
+  for port in $ports; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 8 "http://$LAN_IP:$port/" || true)
+    [[ $code =~ ^(2|3|401) ]] || bad+=" $port(HTTP ${code:-000})"
+  done
+  if [[ -z $bad ]]; then status lan PASS "UIs on http://$LAN_IP ports ${ports// /, } for $LAN_NETWORK (plain HTTP)"
+  else status lan WARNING "LAN listeners configured, not answering yet:$bad"; fi
 }
 
 # =============================================================================
@@ -2240,7 +2386,7 @@ http()   { curl -fsS -o /dev/null --max-time 8 "$@" 2>/dev/null; }
 # svc LABEL UNIT URL
 svc() {
   if ! active "$2"; then fail "$1" "unit $2 is not active" "$2" "service crashed, misconfigured, or port already in use" "systemctl restart $2" "systemctl status $2"
-  elif [[ -n ${3:-} ]] && ! http "$3"; then fail "$1" "$3 did not answer" "$2" "still starting, or listening on a different address" "systemctl restart $2; ss -ltnp | grep ${3##*:}" "curl -v $3"
+  elif [[ -n ${3:-} ]] && ! http "$3"; then fail "$1" "$3 did not answer" "$2" "still starting, or listening on a different address" "systemctl restart $2; journalctl -u $2 -n 40 --no-pager" "curl -v $3"
   else pass "$1"; fi
 }
 PGV=${POSTGRES_VERSION:-17}
@@ -2331,11 +2477,20 @@ if [[ -n ${last:-} ]] && (( $(date +%s) - last < 93600 )) && active opsora-backu
 else fail "Backup" "no successful backup in the last 26 hours, or timer inactive" opsora-backup.service "disk full, PostgreSQL down, or timer disabled" "systemctl enable --now opsora-backup.timer; systemctl start opsora-backup.service" "journalctl -u opsora-backup -n 30"; fi
 # Security
 ssh_port=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}'); ssh_port=${ssh_port:-22}
-pub=$(ss -H -ltnp 2>/dev/null | awk -v sp="$ssh_port" -v ob="${OTLP_BIND:-127.0.0.1}" '{
+LAN_IP=; LAN_PORTS=
+# shellcheck disable=SC1091
+[[ -f /etc/opsora/lan.env ]] && . /etc/opsora/lan.env
+if [[ -n $LAN_IP ]]; then
+  lbad=""
+  for p in $LAN_PORTS; do c=$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 8 "http://$LAN_IP:$p/"); [[ $c =~ ^(2|3|401) ]] || lbad+=" $p(HTTP $c)"; done
+  [[ -z $lbad ]] && pass "LAN web access (http://$LAN_IP ports $LAN_PORTS)" || fail "LAN web access" "not answering:$lbad" nginx "server IP changed, Nginx not reloaded, or backend down" "check 'hostname -I' against LAN_IP in /etc/opsora/lan.env, then re-run the installer with --component lan" "curl -I http://$LAN_IP:${LAN_PORTS%% *}/"
+fi
+pub=$(ss -H -ltnp 2>/dev/null | awk -v sp="$ssh_port" -v ob="${OTLP_BIND:-127.0.0.1}" -v lip="$LAN_IP" -v lp=" $LAN_PORTS " '{
   split($4,a,":"); port=a[length(a)]; addr=substr($4,1,length($4)-length(port)-1)
   if (addr ~ /^(127\.|\[::1\]|::1)/) next
   if (port==sp || port==80 || port==443) next
   if ((port==4317 || port==4318) && addr==ob) next
+  if (lip != "" && addr==lip && index(lp, " "port" ")) next
   print addr":"port" "$6 }' | sort -u)
 [[ -z $pub ]] && pass "Security: no unexpected non-loopback listeners" || wrn "Security: non-loopback listeners" "$(tr '\n' ';' <<<"$pub")"
 loose=$(find $SEC -type f -perm /077 2>/dev/null | head -5)
@@ -2375,7 +2530,8 @@ step_validation() {
 # =============================================================================
 ui_row() { # NAME DOMAIN PORT UNIT AUTH PURPOSE
   local url="http://127.0.0.1:$3 (SSH tunnel: ssh -L $3:127.0.0.1:$3 user@server)" https=no access=internal
-  if [[ -n $2 && -f /etc/letsencrypt/live/$2/fullchain.pem ]]; then url="https://$2"; https=yes; access=external; fi
+  if [[ -n $2 && -f /etc/letsencrypt/live/$2/fullchain.pem ]]; then url="https://$2"; https=yes; access=external
+  elif is_true "$LAN_ACCESS"; then url="http://$LAN_IP:$3"; access="LAN $LAN_NETWORK"; fi
   printf '| %s | %s | %s | %s | 127.0.0.1:%s | %s | %s | %s |\n' "$1" "$url" "$6" "$5" "$3" "$4" "$https" "$access"
 }
 step_report() {
@@ -2576,6 +2732,36 @@ EOF
     echo '```'
     echo; echo "See also: VERSIONS.md, PORTS.md, WEB-UI.md, INTEGRATION.md, OPERATIONS.md, TROUBLESHOOTING.md."
   } | write_file "$DOC_DIR/INSTALLATION-REPORT.md" 0644
+  # helper that prints every UI address with its login (reads the secrets at run time)
+  local rows="" r
+  crow() { # NAME DOMAIN PORT USER SECRET
+    local u="http://127.0.0.1:$3"
+    if [[ -n $2 && -f /etc/letsencrypt/live/$2/fullchain.pem ]]; then u="https://$2"; elif is_true "$LAN_ACCESS"; then u="http://$LAN_IP:$3"; fi
+    rows+="$1|$u|$4|$5"$'\n'
+  }
+  crow OpenObserve  "$OPENOBSERVE_DOMAIN"  5080 "$OPSORA_ADMIN_EMAIL" openobserve_root
+  if (( keep_on )); then crow Keep "$KEEP_DOMAIN" 3001 admin keep_admin; fi
+  crow Semaphore    "$SEMAPHORE_DOMAIN"    3000 admin semaphore_admin
+  crow pgAdmin      "$PGADMIN_DOMAIN"      5050 "$OPSORA_ADMIN_EMAIL" pgadmin_admin
+  if [[ -n $(all_domains) ]] || is_true "$LAN_ACCESS"; then r=nginx_basic_auth; else r="-"; fi
+  crow Prometheus   "$PROMETHEUS_DOMAIN"   9090 "$([[ $r == - ]] && echo - || echo admin)" "$r"
+  crow Alertmanager "$ALERTMANAGER_DOMAIN" 9093 "$([[ $r == - ]] && echo - || echo admin)" "$r"
+  write_file /usr/local/sbin/opsora-credentials 0750 <<EOF
+#!/usr/bin/env bash
+# Generated by the OPSORA installer (report step). Prints web UI addresses and logins.
+[[ \$EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+printf '%-13s %-34s %-22s %s\n' "UI" "ADDRESS" "USER" "PASSWORD"
+while IFS='|' read -r n u usr sec; do
+  [[ -n \$n ]] || continue
+  if [[ \$sec == - ]]; then pw="(no login on localhost)"; else pw=\$(cat "$SECRETS_DIR/\$sec" 2>/dev/null || echo "?"); fi
+  printf '%-13s %-34s %-22s %s\n' "\$n" "\$u" "\$usr" "\$pw"
+done <<'ROWS'
+$rows
+ROWS
+echo
+echo "No web UI (command line): HolmesGPT -> sudo opsora-holmes ask \"...\"   K8sGPT -> sudo opsora-k8sgpt <cluster> analyze"
+echo "                          Ansible, Terraform (run them through Semaphore), OpenRCA (/opt/opsora/research/openrca)"
+EOF
   status report PASS "documentation written to $DOC_DIR"
 }
 
@@ -2583,12 +2769,12 @@ EOF
 # Runner
 # =============================================================================
 ALL_STEPS=(preflight os time security nginx postgresql pgvector redis pgadmin openobserve alloy prometheus alertmanager exporters
-           keep holmesgpt k8sgpt openrca ansible terraform semaphore redisinsight vhosts targets backup validation report)
+           keep holmesgpt k8sgpt openrca ansible terraform semaphore redisinsight vhosts lan targets backup validation report)
 declare -A PHASES=(
   [preflight]="preflight"
   [os]="os time"
   [security]="security"
-  [web]="nginx vhosts"
+  [web]="nginx vhosts lan"
   [database]="postgresql pgvector redis pgadmin"
   [observability]="openobserve alloy prometheus alertmanager exporters keep targets"
   [ai]="holmesgpt k8sgpt openrca"
@@ -2597,7 +2783,7 @@ declare -A PHASES=(
   [backup]="backup"
 )
 usage() {
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
   echo; echo "Steps: ${ALL_STEPS[*]}"; echo "Phases: ${!PHASES[*]}"
 }
 run_step() {
@@ -2650,6 +2836,7 @@ main() {
   echo "Secrets:  $SECRETS_DIR (root only)"
   echo "Docs:     $DOC_DIR"
   echo "Health:   sudo opsora-health-check"
+  echo "Logins:   sudo opsora-credentials   (web UI addresses, users and passwords)"
   echo "Log:      $LOG_DIR/install-$RUN_TS.log"
   if (( ${#FAILED_STEPS[@]} )); then echo "${C_R}Failed steps: ${FAILED_STEPS[*]}${C_0}"; fi
   local s2
