@@ -29,7 +29,7 @@ The repository includes architecture and workflow diagrams illustrating the inte
 
 ### Observability dashboard
 
-![OPSORA Observability Dashboard](OPSORA%2010%2010%20Observability%20Dashboard.png)
+![OPSORA Observability Dashboard](OPSORA 10_10 Observability Dashboard.png)
 
 ### SRE observability architecture guide
 
