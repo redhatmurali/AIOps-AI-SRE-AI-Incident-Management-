@@ -29,7 +29,8 @@ The repository includes architecture and workflow diagrams illustrating the inte
 
 ### Observability dashboard
 
-![OPSORA Observability Dashboard](OPSORA 10_10 Observability Dashboard.png)
+[![OPSORA Observability Dashboard](OPSORA 10_10 Observability Dashboard.png)
+](https://github.com/redhatmurali/AIOps-AI-SRE-AI-Incident-Management-/blob/main/OPSORA%2010_10%20Observability%20Dashboard.png)
 
 ### SRE observability architecture guide
 
